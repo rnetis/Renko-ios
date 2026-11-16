@@ -1,0 +1,111 @@
+# Toobit Renko (iOS)
+
+A native SwiftUI app that renders a **live Renko chart** of any **Toobit USDT-M perpetual futures** contract, built on real exchange data — no mock, no key required.
+
+- Default contract: **BTC-SWAP-USDT**, with an in-app searchable picker for all ~780 tradable linear USDT-M perpetuals.
+- Auto brick size: **0.5 % of price** (selectable 0.1 % / 0.25 % / 0.5 % / 1 %) — recalculated per brick from its own anchor price, so the chart works for BTC and micro-caps alike without manual steps.
+- Dark terminal look, Canvas-rendered bricks, pan / pinch-zoom, dashed last-price line.
+- Extras: live ticker bar (last price, 24 h change/high/low/volume, connection pill), interval selector, brick count / up-down / streak stats, haptic + optional sound when a brick completes.
+- **iOS 17+**, pure SwiftUI, zero third-party dependencies.
+
+---
+
+## Getting an IPA
+
+### GitHub Actions (recommended)
+
+1. Push this repo to GitHub (or use *Import repository*).
+2. Open the **Actions** tab → workflow **Build IPA** → it runs automatically on every push to `main` (and on tags `v*` / manual dispatch).
+3. Download the **`ToobitRenko-unsigned-ipa`** artifact from the finished run — that's the IPA.
+
+The workflow (`.github/workflows/build-ipa.yml`) does: install [XcodeGen](https://github.com/yonaskolb/XcodeGen) → `xcodegen generate` → `xcodebuild archive` with code signing disabled → zip the `.app` into `Payload/` → upload as artifact. Pushing a tag like `v1.0.0` also creates a GitHub Release with the IPA attached.
+
+> The CI IPA is **unsigned** (no Apple certificate exists on the runner). See *Installing the unsigned IPA* below.
+
+### Build locally
+
+```bash
+git clone <your-fork>
+cd toobit-renko-ios
+brew install xcodegen       # once
+xcodegen generate           # creates ToobitRenko.xcodeproj from project.yml
+open ToobitRenko.xcodeproj
+```
+
+Pick the **ToobitRenko** scheme → run on an iOS 17+ simulator, or set your Apple ID team under *Signing & Capabilities* to run on a device.
+
+---
+
+## Installing the unsigned IPA
+
+An unsigned IPA can't install through Finder/iTunes. Pick one:
+
+| Method | Notes |
+| --- | --- |
+| **Sideloadly** (macOS/Windows) | Free Apple ID, 7-day signature, drag-and-drop. |
+| **AltStore / SideStore** | Refreshes the 7-day signature from your device. |
+| **TrollStore** | Permanently signed on supported iOS versions. |
+| **Xcode re-sign** | Open the generated project locally, set your team, archive & install — fully "proper" signing. |
+
+iOS 17 requires **Developer Mode** (Settings → Privacy & Security) to launch sideloaded apps.
+
+---
+
+## How it works
+
+### Data sources (public Toobit endpoints, verified live)
+
+| What | Endpoint |
+| --- | --- |
+| Contract list | `GET https://api.toobit.com/api/v1/exchangeInfo` → `contracts[]` (filter `inverse == false`, `marginToken == "USDT"`, `status == "TRADING"`; tick size from `PRICE_FILTER`) |
+| History candles | `GET https://api.toobit.com/quote/v1/klines?symbol=BTC-SWAP-USDT&interval=1m&limit=1000` → rows of `[openTime, open, high, low, close, volume, …]` |
+| Live stream | `wss://stream.toobit.com/quote/ws/v1`, subscribe `{"symbol":"BTC-SWAP-USDT","topic":"realtimes","event":"sub","params":{"binary":false}}` |
+| Heartbeat | send `{"ping": <epoch ms>}` every 20 s → server replies `{"pong": …}` |
+
+Docs: <https://api-docs.toobit.com/api/usdt-m-market-data.html> and the websocket section of the same site. Toobit returns most quote numbers as JSON strings — the REST parser accepts both forms.
+
+### Flow
+
+1. `MarketSession` (an `ObservableObject`) loads the contract list once at launch.
+2. For the selected symbol + interval it fetches up to **1000 candles** and replays their closes through `RenkoEngine` to build the initial bricks.
+3. The WebSocket `realtimes` topic then pushes every last-traded price (`c`) — that tick feeds the engine live and updates the ticker bar. Prices arriving while history is still seeding are buffered and applied afterwards, so no tick is lost.
+4. Network resilience: 20 s JSON heartbeat doubles as a watchdog. If nothing arrives for 45 s the socket is torn down and the reconnect loop retries with 2 s → 15 s backoff, resubscribing automatically. Status shows as a pill (`LIVE` / `CONNECTING` / `RETRY #n`).
+
+### Renko algorithm
+
+Bricks are computed in **log-price space** with step `ln(1 + brickPercent)`, which is equivalent to "each brick is `brickPercent` of its anchor price":
+
+- Continuation brick: price closes one step beyond the last brick's close.
+- Reversal brick: price closes one step beyond the last brick's **open** (the classic two-brick swing).
+- A single tick can stack multiple bricks (big moves); reversal bricks get a subtle outline.
+- Because each brick derives its size from its own anchor, the size tracks the price level continuously — this is what makes "auto % of price" work.
+
+The **interval selector** only affects the granularity of the history seed (1 m → 1 d); the live feed is always tick-level via the ticker stream.
+
+### Project layout
+
+```
+project.yml                          # XcodeGen spec → ToobitRenko.xcodeproj
+Sources/ToobitRenko/
+  App/          ToobitRenkoApp.swift, RootView.swift
+  Models/       Candle, RenkoBrick, TickerSnapshot, ContractInfo
+  Networking/   ToobitREST (klines + exchangeInfo)
+  Engine/       RenkoEngine (log-space percentage Renko)
+  Services/     MarketSession (REST seed + WS feed + reconnect loop)
+  Views/        RenkoChartView (Canvas), TickerBar, IntervalRow, SymbolPicker, StatsBar
+  Support/      Theme, Formatters, Haptics
+.github/workflows/build-ipa.yml      # unsigned IPA CI
+```
+
+---
+
+## Notes & limits
+
+- Public endpoints only — the app never touches your Toobit account and holds no API keys.
+- After a reconnect, bricks formed during the gap are not backfilled (the chart continues from the current price). Switching interval or reopening the app re-seeds history.
+- Oldest bricks are trimmed beyond 4000 to keep memory flat; the chart window and stats are unaffected.
+- **Not financial advice.** Renko is a visualization of price movement, not a signal.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
