@@ -10,81 +10,152 @@ enum StreamStatus: Equatable {
 }
 
 /// Owns everything market-related: the contract list, the Renko engine, the
-/// history seed and the live WebSocket feed.
+/// history seed, the live WebSocket feed and the favourites watchlist.
 ///
 /// Data flow:
-/// 1. `bootstrapIfNeeded()` loads the contract list from `exchangeInfo`.
-/// 2. `seedHistory()` pulls up to 1000 candles via REST and replays their
-///    closes through `RenkoEngine` to build the initial bricks.
+/// 1. `bootstrapIfNeeded()` starts the history seed + socket immediately and
+///    loads the contract list in parallel (the chart never waits for it).
+/// 2. `startSeed()` pulls up to 1000 candles via REST and replays them
+///    (open / extreme / extreme / close) through `RenkoEngine`.
 /// 3. `connect()` opens `wss://stream.toobit.com/quote/ws/v1` and subscribes
 ///    to the `realtimes` topic; every last-traded price feeds the engine.
-/// 4. A 20 s JSON heartbeat (`{"ping": ms}`) doubles as a staleness watchdog:
-///    if nothing arrives for 45 s the socket is cancelled and the reconnect
-///    loop (2 s … 15 s backoff) starts over with a fresh subscription.
+///    Ticks that arrive while the seed is in flight are buffered.
+/// 4. A 20 s JSON heartbeat doubles as a staleness watchdog: if nothing
+///    arrives for 45 s the socket is cancelled and the reconnect loop
+///    (2 s … 15 s backoff) starts over. After any reconnect, or after the app
+///    returns from a long stay in the background, history is re-seeded so
+///    bricks formed during the gap are backfilled instead of lost.
 @MainActor
 final class MarketSession: ObservableObject {
 
     // MARK: - Published state
 
-    @Published private(set) var contracts: [ContractInfo] = []
+    @Published private(set) var contracts: [ContractInfo] = [] {
+        didSet {
+            contractIndex = Dictionary(contracts.map { ($0.symbol, $0) },
+                                       uniquingKeysWith: { first, _ in first })
+        }
+    }
+    @Published private(set) var contractError: String?
     @Published private(set) var bricks: [RenkoBrick] = []
+    @Published private(set) var analysis = RenkoAnalysis.empty
+    @Published private(set) var triggers: PriceTriggers?
     @Published private(set) var ticker: TickerSnapshot?
     @Published private(set) var status: StreamStatus = .idle
     @Published private(set) var loadError: String?
     @Published private(set) var isSeeding = false
 
+    @Published private(set) var favorites: [String] = []
+    @Published private(set) var scanRows: [ScanRow] = []
+    @Published private(set) var isScanning = false
+    @Published private(set) var scanFailures = 0
+    @Published private(set) var scanLabel: String?
+    @Published private(set) var lastScanAt: Date?
+
     /// Selected contract, e.g. `BTC-SWAP-USDT`.
     @Published var symbol = "BTC-SWAP-USDT" {
-        didSet { if symbol != oldValue { restart() } }
+        didSet {
+            guard symbol != oldValue else { return }
+            defaults.set(symbol, forKey: Keys.symbol)
+            restart()
+        }
     }
     /// Candle granularity used to seed history (`1m`…`1d`).
     @Published var interval = "1m" {
-        didSet { if interval != oldValue { restart() } }
+        didSet {
+            guard interval != oldValue else { return }
+            defaults.set(interval, forKey: Keys.interval)
+            restart()
+        }
     }
     /// Relative brick size, e.g. `0.005` == 0.5 % of price.
     @Published var brickPercent = 0.005 {
-        didSet { if brickPercent != oldValue { restart() } }
+        didSet {
+            guard brickPercent != oldValue else { return }
+            defaults.set(brickPercent, forKey: Keys.brick)
+            restart()
+        }
     }
     /// Sound effect on a completed brick (haptics stay on).
-    @Published var soundOn = true
+    @Published var soundOn = true {
+        didSet { defaults.set(soundOn, forKey: Keys.sound) }
+    }
 
     /// Mirrors the scene phase; feedback is suppressed while the app is in the background.
-    var isAppActive = true
+    private(set) var isAppActive = true
 
     // MARK: - Static choices
 
     static let intervals = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
     static let brickPercentChoices: [Double] = [0.001, 0.0025, 0.005, 0.01]
+    static let maxFavorites = 20
 
     private static let maxBricks = 4000
     private static let historyLimit = 1000
+    /// Time in the background after which the feed is rebuilt on return.
+    private static let resumeResyncAfter: TimeInterval = 15
+
+    private enum Keys {
+        static let symbol = "session.symbol"
+        static let interval = "session.interval"
+        static let brick = "session.brickPercent"
+        static let sound = "session.soundOn"
+        static let favorites = "session.favorites"
+    }
 
     // MARK: - Internals
 
+    private let defaults = UserDefaults.standard
     private var engine = RenkoEngine(relativeStep: 0.005)
+    private var contractIndex: [String: ContractInfo] = [:]
     private let streamURL = URL(string: "wss://stream.toobit.com/quote/ws/v1")!
     private var socketTask: URLSessionWebSocketTask?
     private var readTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var seedTask: Task<Void, Never>?
-    /// Bumped on every symbol/interval/size change; stale socket events are dropped.
+    /// Bumped on every (re)connect; events from older sockets are dropped.
     private var generation = 0
+    /// Bumped on every seed; only the newest seed may touch state.
+    private var seedToken = 0
     private var attempt = 0
     private var lastMessageAt: Date?
+    private var backgroundedAt: Date?
+    /// Set when ticks may have been missed; the next live message triggers a re-seed.
+    private var needsResync = false
     /// Latest live price seen while history is still seeding, applied afterwards.
     private var pendingLive: (price: Double, time: Date)?
     private var bootstrapStarted = false
 
+    // MARK: - Init
+
+    init() {
+        if let saved = defaults.string(forKey: Keys.symbol), !saved.isEmpty {
+            symbol = saved
+        }
+        if let saved = defaults.string(forKey: Keys.interval), Self.intervals.contains(saved) {
+            interval = saved
+        }
+        let savedBrick = defaults.double(forKey: Keys.brick)
+        if Self.brickPercentChoices.contains(savedBrick) {
+            brickPercent = savedBrick
+        }
+        if defaults.object(forKey: Keys.sound) != nil {
+            soundOn = defaults.bool(forKey: Keys.sound)
+        }
+        favorites = defaults.stringArray(forKey: Keys.favorites) ?? []
+        engine = RenkoEngine(relativeStep: brickPercent)
+    }
+
     // MARK: - Derived
 
     var selectedContract: ContractInfo? {
-        contracts.first { $0.symbol == symbol }
+        contractIndex[symbol]
     }
 
     /// Decimal places for price strings, derived from the contract tick size.
     var decimals: Int {
-        if let contract = selectedContract {
+        if let contract = contractIndex[symbol] {
             return Format.decimals(forTick: contract.tickSize)
         }
         if let price = ticker?.lastPrice {
@@ -93,9 +164,15 @@ final class MarketSession: ObservableObject {
         return 2
     }
 
+    func decimals(for symbol: String, price: Double) -> Int {
+        if let contract = contractIndex[symbol] {
+            return Format.decimals(forTick: contract.tickSize)
+        }
+        return price >= 100 ? 2 : (price >= 1 ? 3 : 6)
+    }
+
     var displayName: String {
-        selectedContract?.displayName
-            ?? symbol.replacingOccurrences(of: "-SWAP-USDT", with: "USDT") + ".P"
+        selectedContract?.displayName ?? ContractInfo.displayName(for: symbol)
     }
 
     // MARK: - Lifecycle
@@ -103,38 +180,38 @@ final class MarketSession: ObservableObject {
     func bootstrapIfNeeded() {
         guard !bootstrapStarted else { return }
         bootstrapStarted = true
-        Task { await bootstrap() }
-    }
-
-    private func bootstrap() async {
-        await loadContracts()
-        await seedHistory()
-        connect()
+        // The chart does not need the 780-contract list, so start it right away.
+        restart()
+        Task { await loadContracts() }
     }
 
     func loadContracts() async {
         do {
-            contracts = try await ToobitREST.contracts()
+            let list = try await ToobitREST.contracts()
+            contracts = list
+            contractError = nil
         } catch {
-            loadError = "Could not load contract list: \(error.localizedDescription)"
+            contractError = "Could not load contract list: \(error.localizedDescription)"
         }
     }
 
     /// Tears everything down and starts over with the current settings.
     func restart() {
-        generation += 1
+        guard bootstrapStarted else { return }
         teardownSocket()
         reconnectTask?.cancel()
         reconnectTask = nil
-        seedTask?.cancel()
         bricks = []
+        analysis = .empty
+        triggers = nil
         engine = RenkoEngine(relativeStep: brickPercent)
         ticker = nil
         loadError = nil
         attempt = 0
+        needsResync = false
         status = .idle
         pendingLive = nil
-        seedTask = Task { await seedHistory() }
+        startSeed()
         connect()
     }
 
@@ -143,59 +220,107 @@ final class MarketSession: ObservableObject {
         restart()
     }
 
+    /// Called from the scene phase. Coming back from a long stay in the
+    /// background the socket is usually dead and ticks were missed, so the
+    /// feed is rebuilt (reconnect + history re-seed).
+    func setAppActive(_ active: Bool) {
+        let wasActive = isAppActive
+        isAppActive = active
+        guard bootstrapStarted else { return }
+        if !active {
+            if wasActive { backgroundedAt = Date() }
+            return
+        }
+        if let since = backgroundedAt,
+           Date().timeIntervalSince(since) > Self.resumeResyncAfter {
+            needsResync = true
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            attempt = 0
+            connect()
+        }
+        backgroundedAt = nil
+    }
+
     // MARK: - History seed
 
-    private func seedHistory() async {
-        let gen = generation
+    private func startSeed() {
+        seedTask?.cancel()
+        seedToken += 1
+        let token = seedToken
         isSeeding = true
-        defer { isSeeding = false }
+        seedTask = Task { [weak self] in
+            await self?.seedHistory(token: token)
+        }
+    }
+
+    private func seedHistory(token: Int) async {
+        // A cancelled/superseded seed must not clear the flag of the newer one.
+        defer { if token == seedToken { isSeeding = false } }
+        let seedSymbol = symbol
+        let seedInterval = interval
         do {
-            let candles = try await ToobitREST.klines(
-                symbol: symbol,
-                interval: interval,
+            var candles = try await ToobitREST.klines(
+                symbol: seedSymbol,
+                interval: seedInterval,
                 limit: Self.historyLimit
             )
-            guard gen == generation, !Task.isCancelled else { return }
-            engine.reset()
+            guard token == seedToken, !Task.isCancelled else { return }
+            candles.sort { $0.openTime < $1.openTime }
+
+            var fresh = RenkoEngine(relativeStep: brickPercent)
             for candle in candles {
-                engine.append(price: candle.close, at: candle.openDate)
+                fresh.append(candle: candle)
             }
-            engine.trimOldest(keeping: Self.maxBricks)
-            bricks = engine.bricks
+            fresh.trimOldest(keeping: Self.maxBricks)
+            engine = fresh
+            publishBricks()
             loadError = nil
+
             if let pending = pendingLive {
                 pendingLive = nil
                 feed(price: pending.price, at: pending.time)
             }
         } catch {
-            guard gen == generation, !Task.isCancelled else { return }
+            guard token == seedToken, !Task.isCancelled else { return }
             loadError = "History unavailable: \(error.localizedDescription)"
         }
     }
 
     // MARK: - Live feed
 
+    /// Single place where engine state becomes UI state. Runs once per
+    /// completed brick (never per tick), so the O(n) analysis is cheap.
+    private func publishBricks() {
+        bricks = engine.bricks
+        analysis = RenkoAnalysis(bricks: bricks)
+        triggers = engine.triggers
+    }
+
     private func feed(price: Double, at time: Date) {
         let fresh = engine.append(price: price, at: time)
         guard !fresh.isEmpty else { return }
-        bricks.append(contentsOf: fresh)
         engine.trimOldest(keeping: Self.maxBricks)
-        if bricks.count > Self.maxBricks {
-            bricks.removeFirst(bricks.count - Self.maxBricks)
-        }
+        let previousBias = analysis.bias
+        publishBricks()
         guard isAppActive, let last = fresh.last else { return }
         Haptics.brickHaptic(up: last.isUp)
         if soundOn {
             Haptics.playBrickSound()
+        }
+        if analysis.bias != previousBias, analysis.bias != .wait {
+            Haptics.biasChangeHaptic()
         }
     }
 
     // MARK: - WebSocket
 
     private func connect() {
-        let gen = generation
         teardownSocket()
+        generation += 1
+        let gen = generation
         status = .connecting
+        lastMessageAt = Date()
 
         let task = URLSession.shared.webSocketTask(with: streamURL)
         socketTask = task
@@ -235,6 +360,13 @@ final class MarketSession: ObservableObject {
             if status != .connected {
                 status = .connected
                 attempt = 0
+                if needsResync {
+                    // Ticks were missed while offline: rebuild from history.
+                    // Starting the seed *before* handling this message makes
+                    // sure the tick is buffered instead of fed to a stale engine.
+                    needsResync = false
+                    startSeed()
+                }
             }
             switch message {
             case .string(let text):
@@ -267,9 +399,11 @@ final class MarketSession: ObservableObject {
     private func scheduleReconnect(reason: String) {
         teardownSocket()
         attempt += 1
+        needsResync = true
         status = .reconnecting(attempt: attempt, reason: reason)
         let delaySeconds = min(Double(attempt) * 2.0, 15.0)
         let gen = generation
+        reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
             guard let self, gen == self.generation, !Task.isCancelled else { return }
@@ -316,6 +450,42 @@ final class MarketSession: ObservableObject {
         } else {
             feed(price: price, at: time)
         }
+    }
+
+    // MARK: - Watchlist
+
+    func isFavorite(_ symbol: String) -> Bool {
+        favorites.contains(symbol)
+    }
+
+    func toggleFavorite(_ symbol: String) {
+        if let index = favorites.firstIndex(of: symbol) {
+            favorites.remove(at: index)
+        } else if favorites.count < Self.maxFavorites {
+            favorites.append(symbol)
+        }
+        defaults.set(favorites, forKey: Keys.favorites)
+        scanRows.removeAll { !favorites.contains($0.symbol) }
+    }
+
+    /// Rebuilds Renko state for every favourite with the *current* interval
+    /// and brick size, so rows are directly comparable.
+    func refreshScan() async {
+        guard !isScanning, !favorites.isEmpty else { return }
+        isScanning = true
+        defer { isScanning = false }
+        let symbols = favorites
+        let scanInterval = interval
+        let scanPercent = brickPercent
+        let rows = await RenkoScanner.scan(
+            symbols: symbols,
+            interval: scanInterval,
+            brickPercent: scanPercent
+        )
+        scanRows = rows
+        scanFailures = symbols.count - rows.count
+        scanLabel = "\(scanInterval) history · \(String(format: "%.2f", scanPercent * 100))% bricks"
+        lastScanAt = Date()
     }
 
     // MARK: - Small helpers

@@ -5,7 +5,11 @@ A native SwiftUI app that renders a **live Renko chart** of any **Toobit USDT-M 
 - Default contract: **BTC-SWAP-USDT**, with an in-app searchable picker for all ~780 tradable linear USDT-M perpetuals.
 - Auto brick size: **0.5 % of price** (selectable 0.1 % / 0.25 % / 0.5 % / 1 %) — recalculated per brick from its own anchor price, so the chart works for BTC and micro-caps alike without manual steps.
 - Dark terminal look, Canvas-rendered bricks, pan / pinch-zoom, dashed last-price line.
-- Chart workbench: tap any brick for a crosshair with exact time / open / close / move, pinch out to fit the whole series on screen (**Fit**), and **Live** to snap back to the newest brick.
+- Chart workbench: tap any brick for a crosshair with exact time / open / close / move, pinch out to fit the whole series on screen (**Fit**), and **Live** to snap back to the newest brick. While scrolled back the window stays put as new bricks arrive.
+- **Next-brick triggers**: two dotted lines show the exact prices at which the next up / down brick completes (continuation *and* reversal), so you can see how far price is from printing.
+- **EMA 9 / 21 on brick closes** (toggle with **EMA**) and a descriptive **bias** pill — `LONG`, `SHORT` or `WAIT` — plus a **chop** gauge (share of direction flips in the last 20 bricks). A heavy haptic fires when the bias flips on the selected contract.
+- **Watchlist + scanner**: star up to 20 contracts (toolbar star, or swipe a row in the picker) and open the scanner to compare bias / streak / chop across all of them at the current interval and brick size.
+- Settings (contract, interval, brick size, sound) and the watchlist persist between launches.
 - Extras: live ticker bar (last price, 24 h change/high/low/volume, connection pill), interval selector, brick count / up-down / streak stats, haptic + optional sound when a brick completes.
 - **iOS 17+**, pure SwiftUI, zero third-party dependencies.
 
@@ -26,11 +30,12 @@ The workflow (`.github/workflows/build-ipa.yml`) does: install [XcodeGen](https:
 ### Build locally
 
 ```bash
-git clone <your-fork>
-cd toobit-renko-ios
+git clone https://github.com/rnetis/Renko-ios.git
+cd Renko-ios
 brew install xcodegen       # once
 xcodegen generate           # creates ToobitRenko.xcodeproj from project.yml
 open ToobitRenko.xcodeproj
+swift test                  # engine + analysis unit tests, no simulator needed
 ```
 
 Pick the **ToobitRenko** scheme → run on an iOS 17+ simulator, or set your Apple ID team under *Signing & Capabilities* to run on a device.
@@ -67,10 +72,20 @@ Docs: <https://api-docs.toobit.com/api/usdt-m-market-data.html> and the websocke
 
 ### Flow
 
-1. `MarketSession` (an `ObservableObject`) loads the contract list once at launch.
-2. For the selected symbol + interval it fetches up to **1000 candles** and replays their closes through `RenkoEngine` to build the initial bricks.
-3. The WebSocket `realtimes` topic then pushes every last-traded price (`c`) — that tick feeds the engine live and updates the ticker bar. Prices arriving while history is still seeding are buffered and applied afterwards, so no tick is lost.
-4. Network resilience: 20 s JSON heartbeat doubles as a watchdog. If nothing arrives for 45 s the socket is torn down and the reconnect loop retries with 2 s → 15 s backoff, resubscribing automatically. Status shows as a pill (`LIVE` / `CONNECTING` / `RETRY #n`).
+1. `MarketSession` (an `ObservableObject`) starts the history seed and the socket immediately and loads the contract list in parallel — the chart never waits for the 780-contract `exchangeInfo`.
+2. For the selected symbol + interval it fetches up to **1000 candles** and replays each one as *open → extreme → extreme → close* (bullish: low before high, bearish: high before low) through `RenkoEngine`. Replaying closes only would drop every intra-candle move that reverts before the close.
+3. The WebSocket `realtimes` topic then pushes every last-traded price (`c`) — that tick feeds the engine live and updates the ticker bar. The newest price arriving while history is still seeding is buffered and applied afterwards.
+4. Network resilience: 20 s JSON heartbeat doubles as a watchdog. If nothing arrives for 45 s the socket is torn down and the reconnect loop retries with 2 s → 15 s backoff, resubscribing automatically. **After a reconnect, or after more than 15 s in the background, history is re-seeded so bricks formed during the gap are backfilled.** Status shows as a pill (`LIVE` / `CONNECTING` / `RETRY #n`).
+
+### Bias, chop and the scanner
+
+All of this is computed once per *completed brick* (never per tick) in `Engine/RenkoAnalysis.swift`:
+
+- **EMA 9 / 21** over the brick closes (first value = SMA of the first `period` bricks).
+- **Chop** = direction flips ÷ (n − 1) over the last 20 bricks. 0 is a clean trend, 1 a pure zig-zag.
+- **Bias**: `LONG` when the newest brick is up and EMA 9 > EMA 21, `SHORT` for the mirror image, otherwise `WAIT`. It also reads `WAIT` while fewer than 20 bricks exist or chop is above 50 %.
+
+This is a transparent description of the series, not a backtested strategy. The scanner uses REST history only (4 requests at a time), so it works without extra sockets; rows are not live — pull down to rescan.
 
 ### Renko algorithm
 
@@ -91,11 +106,13 @@ Sources/ToobitRenko/
   App/          ToobitRenkoApp.swift, RootView.swift
   Models/       Candle, RenkoBrick, TickerSnapshot, ContractInfo
   Networking/   ToobitREST (klines + exchangeInfo)
-  Engine/       RenkoEngine (log-space percentage Renko)
-  Services/     MarketSession (REST seed + WS feed + reconnect loop)
-  Views/        RenkoChartView (Canvas), TickerBar, IntervalRow, SymbolPicker, StatsBar
+  Engine/       RenkoEngine (log-space percentage Renko), RenkoAnalysis (EMA, chop, bias)
+  Services/     MarketSession (REST seed + WS feed + reconnect + watchlist), RenkoScanner
+  Views/        RenkoChartView (Canvas), TickerBar, IntervalRow, SymbolPicker, StatsBar, ScannerView
   Support/      Theme, Formatters, Haptics
-.github/workflows/build-ipa.yml      # unsigned IPA CI
+Package.swift                        # SwiftPM harness: compiles Engine + Models for `swift test`
+Tests/RenkoCoreTests/                # engine + analysis unit tests
+.github/workflows/build-ipa.yml      # unit tests + unsigned IPA CI
 ```
 
 ---
@@ -103,7 +120,8 @@ Sources/ToobitRenko/
 ## Notes & limits
 
 - Public endpoints only — the app never touches your Toobit account and holds no API keys.
-- After a reconnect, bricks formed during the gap are not backfilled (the chart continues from the current price). Switching interval or reopening the app re-seeds history.
+- Backfill after a reconnect is as good as the candle granularity: bricks are rebuilt from the interval's candles (open / extreme / extreme / close), so a 1 m seed reproduces the gap closely but not tick-perfectly.
+- iOS suspends the app in the background, so nothing can alert you while it is closed; there is no push channel. The watchlist scan is pull-based.
 - Oldest bricks are trimmed beyond 4000 to keep memory flat; the chart window and stats are unaffected.
 - **Not financial advice.** Renko is a visualization of price movement, not a signal.
 

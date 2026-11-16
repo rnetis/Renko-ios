@@ -6,6 +6,7 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var showSymbolPicker = false
+    @State private var showScanner = false
 
     var body: some View {
         NavigationStack {
@@ -24,14 +25,33 @@ struct RootView: View {
                 chartArea
                 Rectangle().fill(Theme.grid).frame(height: 0.5)
                 StatsBar(
-                    bricks: session.bricks,
+                    analysis: session.analysis,
                     brickPercent: session.brickPercent,
-                    decimals: session.decimals
+                    referencePrice: session.ticker?.lastPrice ?? session.bricks.last?.close
                 )
             }
             .background(Theme.background)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItemGroup(placement: .topBarLeading) {
+                    Button {
+                        showScanner = true
+                    } label: {
+                        Image(systemName: "dot.radiowaves.left.and.right")
+                            .foregroundColor(Theme.accent)
+                    }
+                    .accessibilityLabel("Watchlist scan")
+
+                    Button {
+                        session.toggleFavorite(session.symbol)
+                    } label: {
+                        Image(systemName: session.isFavorite(session.symbol) ? "star.fill" : "star")
+                            .foregroundColor(Theme.accent)
+                    }
+                    .accessibilityLabel(session.isFavorite(session.symbol)
+                                        ? "Remove from watchlist"
+                                        : "Add to watchlist")
+                }
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
                         session.soundOn.toggle()
@@ -56,12 +76,22 @@ struct RootView: View {
                 }
             }
             .sheet(isPresented: $showSymbolPicker) {
-                SymbolPicker(contracts: session.contracts, selection: $session.symbol)
+                SymbolPicker(
+                    contracts: session.contracts,
+                    favorites: session.favorites,
+                    loadError: session.contractError,
+                    selection: $session.symbol,
+                    onToggleFavorite: { session.toggleFavorite($0) },
+                    onReload: { Task { await session.loadContracts() } }
+                )
+            }
+            .sheet(isPresented: $showScanner) {
+                ScannerView()
             }
         }
         .preferredColorScheme(.dark)
         .onChange(of: scenePhase) { _, phase in
-            session.isAppActive = (phase == .active)
+            session.setAppActive(phase == .active)
         }
         .task {
             session.bootstrapIfNeeded()
@@ -100,6 +130,8 @@ struct RootView: View {
         } else {
             RenkoChartView(
                 bricks: session.bricks,
+                analysis: session.analysis,
+                triggers: session.triggers,
                 lastPrice: session.ticker?.lastPrice,
                 decimals: session.decimals
             )

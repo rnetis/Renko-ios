@@ -9,9 +9,16 @@ import SwiftUI
 /// * tap a brick — pin a crosshair and an exact readout (time, open, close, move);
 ///   tap the same brick again to dismiss it;
 /// * **Fit** — zoom out until every kept brick is on screen;
-/// * **Live** — snap back to the newest brick (shown while scrolled back).
+/// * **Live** — snap back to the newest brick (shown while scrolled back);
+/// * **EMA** — toggle the 9 / 21 EMA of brick closes.
+///
+/// While the newest brick is in view, two dotted lines mark the exact prices
+/// at which the next up / down brick completes. While scrolled back, new
+/// bricks no longer shift the window under the finger.
 struct RenkoChartView: View {
     let bricks: [RenkoBrick]
+    let analysis: RenkoAnalysis
+    let triggers: PriceTriggers?
     let lastPrice: Double?
     let decimals: Int
 
@@ -19,8 +26,10 @@ struct RenkoChartView: View {
     @State private var scrollBack: Double = 0
     @State private var dragBase: Double?
     @State private var zoomBase: Double?
-    /// Index into `bricks` of the brick under the inspection crosshair.
-    @State private var inspected: Int?
+    /// `id` of the brick under the inspection crosshair. Ids survive trimming
+    /// and appends, so the crosshair stays on the same brick as the feed moves.
+    @State private var inspectedID: Int?
+    @State private var showEMA = true
 
     private let axisWidth: CGFloat = 64
     private let timeAxisHeight: CGFloat = 20
@@ -34,7 +43,7 @@ struct RenkoChartView: View {
             let width = chartWidth(for: geo.size)
             ZStack(alignment: .topLeading) {
                 Canvas { context, canvasSize in
-                    draw(&context, size: canvasSize, slice: currentSlice)
+                    draw(&context, size: canvasSize, slice: currentSlice, isLive: scrollBack < 0.5)
                 }
                 .contentShape(Rectangle())
                 .gesture(
@@ -60,6 +69,12 @@ struct RenkoChartView: View {
             }
         }
         .clipped()
+        .onChange(of: bricks.last?.id) { old, new in
+            // Keep the window anchored while scrolled back: every new brick
+            // would otherwise slide the visible slice by one brick.
+            guard scrollBack > 0, let old, let new, new > old else { return }
+            scrollBack = min(scrollBack + Double(new - old), Double(max(0, bricks.count - 1)))
+        }
     }
 
     // MARK: - Windowing
@@ -80,8 +95,11 @@ struct RenkoChartView: View {
     }
 
     private var inspectedBrick: RenkoBrick? {
-        guard let inspected, bricks.indices.contains(inspected) else { return nil }
-        return bricks[inspected]
+        // Ids are contiguous (the engine only ever trims from the front).
+        guard let id = inspectedID, let first = bricks.first else { return nil }
+        let index = id - first.id
+        guard bricks.indices.contains(index), bricks[index].id == id else { return nil }
+        return bricks[index]
     }
 
     /// Resolves a tap to the brick under the finger and toggles the crosshair.
@@ -91,8 +109,8 @@ struct RenkoChartView: View {
               point.x >= 0, point.x < width else { return }
         let brickWidth = width / CGFloat(slice.count)
         let offset = min(max(Int(point.x / max(brickWidth, 0.0001)), 0), slice.count - 1)
-        let index = slice.startIndex + offset
-        inspected = inspected == index ? nil : index
+        let brick = bricks[slice.startIndex + offset]
+        inspectedID = inspectedID == brick.id ? nil : brick.id
     }
 
     /// Scrolling follows the finger: dragging right reveals older bricks.
@@ -101,7 +119,7 @@ struct RenkoChartView: View {
             .onChanged { value in
                 if dragBase == nil {
                     dragBase = scrollBack
-                    inspected = nil
+                    inspectedID = nil
                 }
                 let visible = CGFloat(max(minVisible, min(visibleCount, 10_000)))
                 let step = Double(value.translation.width / max(width / visible, 1))
@@ -116,7 +134,7 @@ struct RenkoChartView: View {
             .onChanged { scale in
                 if zoomBase == nil {
                     zoomBase = visibleCount
-                    inspected = nil
+                    inspectedID = nil
                 }
                 let base = zoomBase ?? visibleCount
                 visibleCount = min(max(base / max(scale, 0.05), minVisible), maxVisible)
@@ -133,10 +151,14 @@ struct RenkoChartView: View {
                     scrollBack = 0
                 }
             }
+            control("EMA", systemImage: "waveform.path.ecg") {
+                showEMA.toggle()
+            }
+            .opacity(showEMA ? 1 : 0.5)
             control("Fit", systemImage: "arrow.up.left.and.arrow.down.right") {
                 visibleCount = maxVisible
                 scrollBack = 0
-                inspected = nil
+                inspectedID = nil
             }
         }
         .padding(.trailing, axisWidth + 8)
@@ -195,7 +217,35 @@ struct RenkoChartView: View {
 
     // MARK: - Drawing
 
-    private func draw(_ context: inout GraphicsContext, size: CGSize, slice: ArraySlice<RenkoBrick>) {
+    /// Polyline of an EMA series over the visible slice (indices are global,
+    /// matching `bricks`; `nil` entries break the line).
+    private func emaPath(_ series: [Double?],
+                         range: Range<Int>,
+                         brickWidth: CGFloat,
+                         y: (Double) -> CGFloat) -> Path {
+        var path = Path()
+        var started = false
+        for global in range {
+            guard global < series.count, let value = series[global] else {
+                started = false
+                continue
+            }
+            let point = CGPoint(x: CGFloat(global - range.lowerBound) * brickWidth + brickWidth / 2,
+                                y: y(value))
+            if started {
+                path.addLine(to: point)
+            } else {
+                path.move(to: point)
+                started = true
+            }
+        }
+        return path
+    }
+
+    private func draw(_ context: inout GraphicsContext,
+                      size: CGSize,
+                      slice: ArraySlice<RenkoBrick>,
+                      isLive: Bool) {
         let all = Array(slice)
         guard !all.isEmpty, size.width > axisWidth + 20, size.height > timeAxisHeight + 20 else { return }
 
@@ -211,6 +261,11 @@ struct RenkoChartView: View {
         if let lp = lastPrice {
             lowBound = min(lowBound, lp)
             highBound = max(highBound, lp)
+        }
+        // Keep the next-brick trigger levels on screen while following the feed.
+        if isLive, let t = triggers {
+            lowBound = min(lowBound, t.down)
+            highBound = max(highBound, t.up)
         }
         if highBound <= lowBound {
             highBound = lowBound + max(1, lowBound * 0.001)
@@ -260,6 +315,44 @@ struct RenkoChartView: View {
             context.fill(path, with: .color(brick.isUp ? Theme.up : Theme.down))
             if index > 0, all[index - 1].isUp != brick.isUp {
                 context.stroke(path, with: .color(Theme.text.opacity(0.35)), lineWidth: 0.8)
+            }
+        }
+
+        // EMA overlay on brick closes (series is aligned with `bricks`).
+        if showEMA, analysis.emaFast.count == bricks.count {
+            let range = slice.startIndex..<slice.endIndex
+            context.stroke(
+                emaPath(analysis.emaSlow, range: range, brickWidth: bw, y: yPos),
+                with: .color(Theme.emaSlow.opacity(0.9)),
+                lineWidth: 1.2
+            )
+            context.stroke(
+                emaPath(analysis.emaFast, range: range, brickWidth: bw, y: yPos),
+                with: .color(Theme.emaFast.opacity(0.9)),
+                lineWidth: 1.2
+            )
+        }
+
+        // Exact prices at which the next up / down brick completes.
+        if isLive, let t = triggers {
+            let triggerLevels: [(Double, Color, String)] = [(t.up, Theme.up, "▲"), (t.down, Theme.down, "▼")]
+            for (price, color, glyph) in triggerLevels {
+                let y = yPos(price)
+                var line = Path()
+                line.move(to: CGPoint(x: 0, y: y))
+                line.addLine(to: CGPoint(x: chartW, y: y))
+                context.stroke(
+                    line,
+                    with: .color(color.opacity(0.5)),
+                    style: StrokeStyle(lineWidth: 0.8, dash: [2, 4])
+                )
+                context.draw(
+                    Text("\(glyph) \(Format.price(price, decimals: decimals))")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundColor(color.opacity(0.9)),
+                    at: CGPoint(x: 4, y: y + (price == t.up ? 8 : -8)),
+                    anchor: .leading
+                )
             }
         }
 
@@ -313,9 +406,8 @@ struct RenkoChartView: View {
         }
 
         // Inspection crosshair: vertical marker, close-price line and outline.
-        if let global = inspected {
-            let local = global - slice.startIndex
-            if local >= 0, local < all.count {
+        if let id = inspectedID {
+            if let local = all.firstIndex(where: { $0.id == id }) {
                 let brick = all[local]
                 let x = CGFloat(local) * bw + bw / 2
                 var vertical = Path()

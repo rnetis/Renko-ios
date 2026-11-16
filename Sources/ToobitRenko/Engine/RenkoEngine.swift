@@ -1,5 +1,13 @@
 import Foundation
 
+/// Price levels at which the next brick will complete.
+struct PriceTriggers: Equatable, Sendable {
+    /// Price at (or above) which an up brick forms (continuation or reversal).
+    let up: Double
+    /// Price at (or below) which a down brick forms (continuation or reversal).
+    let down: Double
+}
+
 /// Percentage-based Renko builder.
 ///
 /// Bricks live in log-price space so that every brick represents the same
@@ -17,6 +25,10 @@ import Foundation
 struct RenkoEngine: Sendable {
     /// Relative brick size, e.g. `0.005` == 0.5 % of price.
     var relativeStep: Double
+
+    /// Safety valve: a single corrupt tick (e.g. a price 1000x off) must not
+    /// be able to emit tens of thousands of bricks and freeze the UI.
+    private static let maxBricksPerObservation = 2000
 
     /// Explicit init because the stored properties below are private, which
     /// would otherwise make the synthesized memberwise init private too.
@@ -37,11 +49,26 @@ struct RenkoEngine: Sendable {
 
     var lastBrick: RenkoBrick? { bricks.last }
 
+    /// The exact prices at which the next up / down brick completes.
+    /// Before the first brick exists these are one step either side of the
+    /// seed price. `nil` until the engine has seen a price.
+    var triggers: PriceTriggers? {
+        let step = logStep
+        if let top = lastTop, let bottom = lastBottom {
+            return PriceTriggers(up: exp(top + step), down: exp(bottom - step))
+        }
+        if let seed = seedLog {
+            return PriceTriggers(up: exp(seed + step), down: exp(seed - step))
+        }
+        return nil
+    }
+
     /// Clears all state (used when the symbol, interval or brick size changes).
     mutating func reset() {
         bricks.removeAll(keepingCapacity: true)
         lastTop = nil
         lastBottom = nil
+        lastIsUp = true
         seedLog = nil
         nextID = 0
     }
@@ -53,12 +80,31 @@ struct RenkoEngine: Sendable {
         bricks.removeFirst(bricks.count - last)
     }
 
+    /// Feeds one full OHLC candle.
+    ///
+    /// Using only closes (as a naive replay would) silently drops every
+    /// intra-candle move that reverts before the close, so history would
+    /// disagree with what the live tick feed builds. The candle is replayed
+    /// along its most likely path instead: bullish candles visit the low
+    /// before the high, bearish candles the high before the low.
+    @discardableResult
+    mutating func append(candle: Candle) -> [RenkoBrick] {
+        let path: [Double] = candle.close >= candle.open
+            ? [candle.open, candle.low, candle.high, candle.close]
+            : [candle.open, candle.high, candle.low, candle.close]
+        var fresh: [RenkoBrick] = []
+        for price in path {
+            fresh.append(contentsOf: append(price: price, at: candle.openDate))
+        }
+        return fresh
+    }
+
     /// Feeds one price observation and returns every brick it completed.
     @discardableResult
     mutating func append(price: Double, at time: Date) -> [RenkoBrick] {
-        guard price.isFinite, price > 0 else { return [] }
-        let lp = log(price)
         let step = logStep
+        guard price.isFinite, price > 0, step > 0 else { return [] }
+        let lp = log(price)
         var fresh: [RenkoBrick] = []
 
         // Before the first brick exists, seed on the first price and wait for
@@ -78,7 +124,8 @@ struct RenkoEngine: Sendable {
         }
 
         // Drain thresholds: a single tick can stack many continuation bricks.
-        while let top = lastTop, let bottom = lastBottom {
+        while fresh.count < Self.maxBricksPerObservation,
+              let top = lastTop, let bottom = lastBottom {
             if lastIsUp {
                 if lp >= top + step {
                     emit(openLog: top, closeLog: top + step, isUp: true, time: time, into: &fresh)

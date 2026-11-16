@@ -13,7 +13,9 @@ struct ContractInfo: Identifiable, Hashable, Sendable {
     var id: String { symbol }
 
     /// Friendly display name, e.g. `BTC-SWAP-USDT` → `BTCUSDT.P`.
-    var displayName: String {
+    var displayName: String { Self.displayName(for: symbol) }
+
+    static func displayName(for symbol: String) -> String {
         symbol.replacingOccurrences(of: "-SWAP-USDT", with: "USDT") + ".P"
     }
 }

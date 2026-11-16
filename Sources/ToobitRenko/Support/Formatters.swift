@@ -18,6 +18,17 @@ enum Format {
         String(format: "%.\(decimals)f", value)
     }
 
+    /// Price-like value with enough digits to stay meaningful for micro-caps
+    /// (e.g. a 0.5 % brick of a $0.0123 coin is 0.0000615, not "0").
+    static func adaptive(_ value: Double) -> String {
+        let magnitude = abs(value)
+        guard magnitude.isFinite, magnitude > 0 else { return "0" }
+        if magnitude >= 1000 { return String(format: "%.0f", value) }
+        if magnitude >= 1 { return String(format: "%.2f", value) }
+        let digits = min(8, max(2, Int(ceil(-log10(magnitude))) + 2))
+        return String(format: "%.\(digits)f", value)
+    }
+
     /// Signed percentage string, e.g. `+1.23 %`.
     static func signed(_ fraction: Double) -> String {
         let sign = fraction >= 0 ? "+" : ""

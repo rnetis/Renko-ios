@@ -10,6 +10,8 @@ enum Theme {
     static let up = Color(hex: 0x0ECB81)
     static let down = Color(hex: 0xF6465D)
     static let accent = Color(hex: 0xF0B90B)
+    static let emaFast = Color(hex: 0x4FC3F7)
+    static let emaSlow = Color(hex: 0xB388FF)
 }
 
 extension Color {

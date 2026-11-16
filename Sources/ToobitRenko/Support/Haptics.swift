@@ -10,6 +10,11 @@ enum Haptics {
         notifier.notificationOccurred(up ? .success : .warning)
     }
 
+    /// Stronger tap when the LONG / SHORT bias flips on the selected contract.
+    static func biasChangeHaptic() {
+        UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+    }
+
     /// Subtle "Tink" system sound for a completed brick.
     static func playBrickSound() {
         AudioServicesPlaySystemSound(1104)
