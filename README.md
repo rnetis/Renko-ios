@@ -18,7 +18,7 @@ A native SwiftUI app that renders a **live Renko chart** of any **Toobit USDT-M 
 2. Open the **Actions** tab → workflow **Build IPA** → it runs automatically on every push to `main` (and on tags `v*` / manual dispatch).
 3. Download the **`ToobitRenko-unsigned-ipa`** artifact from the finished run — that's the IPA.
 
-The workflow (`.github/workflows/build-ipa.yml`) does: install [XcodeGen](https://github.com/yonaskolb/XcodeGen) → `xcodegen generate` → `xcodebuild archive` with code signing disabled → zip the `.app` into `Payload/` → upload as artifact. Pushing a tag like `v1.0.0` also creates a GitHub Release with the IPA attached.
+The workflow (`.github/workflows/build-ipa.yml`) does: install [XcodeGen](https://github.com/yonaskolb/XcodeGen) → `xcodegen generate` → `xcodebuild archive` with code signing disabled → zip the `.app` into `Payload/` → upload as artifact. It also cuts a GitHub Release with the IPA attached: a push to `main` publishes `v<MARKETING_VERSION>` (the tag is created at the pushed commit if missing, and an existing release of that version gets its IPA replaced), and pushing a `v*` tag publishes that tag. So a new release = bump `MARKETING_VERSION` in `project.yml` and push to `main`.
 
 > The CI IPA is **unsigned** (no Apple certificate exists on the runner). See *Installing the unsigned IPA* below.
 

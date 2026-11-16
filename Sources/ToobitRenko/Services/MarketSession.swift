@@ -325,8 +325,10 @@ final class MarketSession: ObservableObject {
         return text.count > 60 ? String(text.prefix(60)) : text
     }
 
+    /// Toobit sends `t` as a JSON string on some streams, so parse both forms
+    /// instead of only `NSNumber` (which would stamp every brick at 1970).
     private func dateFromMillis(_ any: Any?) -> Date {
-        let ms = (any as? NSNumber)?.doubleValue ?? 0
+        guard let ms = ToobitREST.number(any), ms > 0 else { return Date() }
         return Date(timeIntervalSince1970: ms / 1000)
     }
 }

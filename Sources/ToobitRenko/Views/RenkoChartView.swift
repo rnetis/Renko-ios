@@ -188,14 +188,28 @@ struct RenkoChartView: View {
                 with: .color(Theme.accent.opacity(0.8)),
                 style: StrokeStyle(lineWidth: 0.8, dash: [4, 3])
             )
-            let pill = Text(Format.price(lp, decimals: decimals))
-                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundColor(Theme.background)
-                .padding(.horizontal, 5)
-                .padding(.vertical, 2)
-                .background(Theme.accent)
-                .cornerRadius(3)
-            context.draw(pill, at: CGPoint(x: chartW + axisWidth / 2, y: y))
+            // Canvas can only draw text, images and resolved symbols — not
+            // arbitrary views — so the pill background is a path and the
+            // label is a resolved (re-shaded) Text.
+            var label = context.resolve(
+                Text(Format.price(lp, decimals: decimals))
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+            )
+            let textSize = label.measure(in: CGSize(width: axisWidth, height: timeAxisHeight))
+            let pillHeight = textSize.height + 4
+            let pillWidth = min(textSize.width + 10, axisWidth - 4)
+            let pillRect = CGRect(
+                x: chartW + 2,
+                y: y - pillHeight / 2,
+                width: pillWidth,
+                height: pillHeight
+            )
+            context.fill(
+                Path(roundedRect: pillRect, cornerRadius: 3),
+                with: .color(Theme.accent)
+            )
+            label.shading = .color(Theme.background)
+            context.draw(label, at: CGPoint(x: pillRect.midX, y: pillRect.midY))
         }
     }
 }
