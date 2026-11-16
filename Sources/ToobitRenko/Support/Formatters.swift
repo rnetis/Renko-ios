@@ -57,6 +57,17 @@ enum Format {
         return formatter
     }()
 
+    private static let exactFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MM/dd HH:mm:ss"
+        return formatter
+    }()
+
+    /// Full timestamp (down to the second) for the chart's brick readout.
+    static func exact(_ date: Date) -> String {
+        exactFormatter.string(from: date)
+    }
+
     /// Picks a compact time format based on the visible time span.
     static func axisTime(_ date: Date, span: TimeInterval) -> String {
         switch span {

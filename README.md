@@ -5,6 +5,7 @@ A native SwiftUI app that renders a **live Renko chart** of any **Toobit USDT-M 
 - Default contract: **BTC-SWAP-USDT**, with an in-app searchable picker for all ~780 tradable linear USDT-M perpetuals.
 - Auto brick size: **0.5 % of price** (selectable 0.1 % / 0.25 % / 0.5 % / 1 %) — recalculated per brick from its own anchor price, so the chart works for BTC and micro-caps alike without manual steps.
 - Dark terminal look, Canvas-rendered bricks, pan / pinch-zoom, dashed last-price line.
+- Chart workbench: tap any brick for a crosshair with exact time / open / close / move, pinch out to fit the whole series on screen (**Fit**), and **Live** to snap back to the newest brick.
 - Extras: live ticker bar (last price, 24 h change/high/low/volume, connection pill), interval selector, brick count / up-down / streak stats, haptic + optional sound when a brick completes.
 - **iOS 17+**, pure SwiftUI, zero third-party dependencies.
 
