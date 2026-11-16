@@ -1,0 +1,85 @@
+name: Build IPA
+
+# Builds an UNSIGNED release IPA on every push to main (and on tags/dispatch).
+# No Apple certificate is used — sideload the IPA with Sideloadly / AltStore /
+# TrollStore, or open the project in Xcode and sign with your own team.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ipa:
+    name: Archive & package unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Archive (unsigned, Release)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project ToobitRenko.xcodeproj \
+            -scheme ToobitRenko \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/ToobitRenko.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            | tee build.log | tail -40
+
+      - name: Package IPA
+        run: |
+          APP_PATH=$(find build/ToobitRenko.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)
+          echo "Found app bundle: $APP_PATH"
+          test -n "$APP_PATH"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -q -r ToobitRenko-unsigned.ipa Payload
+          ls -lh ToobitRenko-unsigned.ipa
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ToobitRenko-unsigned-ipa
+          path: ToobitRenko-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Attach IPA to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Toobit Renko $GITHUB_REF_NAME" \
+            --generate-notes \
+            ToobitRenko-unsigned.ipa \
+          || gh release upload "$GITHUB_REF_NAME" ToobitRenko-unsigned.ipa --clobber
